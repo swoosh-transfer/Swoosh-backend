@@ -41,7 +41,7 @@ mongoose.connect(MONGODB_URI)
 const app = express();
 
 // CORS configuration for frontend
-const allowedOrigins = process.env.ALLOWED_ORIGINS 
+const rawAllowedOrigins = process.env.ALLOWED_ORIGINS 
   ? process.env.ALLOWED_ORIGINS.split(',').map(origin => origin.trim())
   : [
       'https://swoosh-transfer.vercel.app',
@@ -49,11 +49,16 @@ const allowedOrigins = process.env.ALLOWED_ORIGINS
       'http://localhost:3000'
     ];
 
+// Normalize to avoid trailing-slash mismatches with the Origin header
+const allowedOrigins = rawAllowedOrigins.map(o => o.replace(/\/$/, ''));
+
 app.use(cors({
   origin: function (origin, callback) {
-    // Allow requests with no origin (like mobile apps or curl)
-    // if (!origin) return callback(null, true);
-    if (allowedOrigins.indexOf(origin) !== -1) {
+    // Block requests with no Origin header to avoid unauthenticated sources (curl, scripts)
+    if (!origin) return callback(new Error('Origin header required'));
+
+    const normalizedOrigin = origin.replace(/\/$/, '');
+    if (allowedOrigins.includes(normalizedOrigin)) {
       callback(null, true);
     } else {
       callback(new Error('Not allowed by CORS'));
