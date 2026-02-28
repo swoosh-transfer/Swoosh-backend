@@ -52,6 +52,27 @@ const rawAllowedOrigins = process.env.ALLOWED_ORIGINS
 // Normalize to avoid trailing-slash mismatches with the Origin header
 const allowedOrigins = rawAllowedOrigins.map(o => o.replace(/\/$/, ''));
 
+// CORS configuration for ping endpoint (allows different origins)
+const pingAllowedOrigins = process.env.PING_ALLOWED_ORIGINS 
+  ? process.env.PING_ALLOWED_ORIGINS.split(',').map(origin => origin.trim())
+  : '*'; // Allow all origins for ping endpoint by default
+
+const pingCorsOptions = {
+  origin: pingAllowedOrigins === '*' ? true : function (origin, callback) {
+    // Allow requests without origin (e.g., curl, cron jobs)
+    if (!origin) return callback(null, true);
+    
+    const normalizedOrigin = origin.replace(/\/$/, '');
+    if (pingAllowedOrigins.includes(normalizedOrigin)) {
+      callback(null, true);
+    } else {
+      callback(null, true); // Allow ping from any origin by default
+    }
+  },
+  credentials: false
+};
+
+// Standard CORS configuration for main app
 app.use(cors({
   origin: function (origin, callback) {
     // Block requests with no Origin header to avoid unauthenticated sources (curl, scripts)
@@ -347,6 +368,17 @@ io.on("connection", (socket) => {
 });
 
 // --- ANALYTICS API ENDPOINTS ---
+
+// Ping endpoint for keeping app alive (Render free plan, cron jobs, etc.)
+// Allows requests from any origin
+app.get('/ping', cors(pingCorsOptions), (req, res) => {
+  res.json({ 
+    status: 'pong', 
+    timestamp: new Date().toISOString(),
+    uptime: process.uptime(),
+    mongodb: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected'
+  });
+});
 
 // Health check endpoint
 app.get('/health', (req, res) => {
