@@ -78,8 +78,13 @@ const io = new Server(server, {
   }
 });
 
-// Map<RoomID, UserCount> - Tracks only the number of users
-const roomOccupancy = new Map();
+// Map<RoomID, Set<SocketID>> - Tracks connected users in each room
+// Map<SocketID, RoomID> - Tracks which room a socket belongs to
+const roomUsers = new Map();
+const userRoomMap = new Map();
+
+const MAX_ROOM_CAPACITY = 2;
+const ROOM_ID_LENGTH = 6;
 
 /**
  * Generates a random 6-character Room ID
@@ -87,10 +92,42 @@ const roomOccupancy = new Map();
 function generateRoomId() {
   const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
   let result = '';
-  for (let i = 0; i < 6; i++) {
+  for (let i = 0; i < ROOM_ID_LENGTH; i++) {
     result += chars.charAt(Math.floor(Math.random() * chars.length));
   }
   return result;
+}
+
+/**
+ * Get current room occupancy
+ */
+function getRoomOccupancy(roomId) {
+  return roomUsers.get(roomId)?.size || 0;
+}
+
+/**
+ * Check if room is full
+ */
+function isRoomFull(roomId) {
+  return getRoomOccupancy(roomId) > MAX_ROOM_CAPACITY;
+}
+
+/**
+ * Check if room exists and is active
+ */
+function roomExists(roomId) {
+  return roomUsers.has(roomId);
+}
+
+/**
+ * Delete room and notify clients
+ */
+function deleteRoom(roomId) {
+  if (roomUsers.has(roomId)) {
+    io.to(roomId).emit("room-dismissed", { roomId, reason: "Room closed" });
+    roomUsers.delete(roomId);
+    log(`[Room Dismissed] ID: ${roomId} - No users remaining`);
+  }
 }
 
 io.on("connection", (socket) => {
@@ -101,45 +138,121 @@ io.on("connection", (socket) => {
   socket.on("create-room", async () => {
     const roomId = generateRoomId();
     
+    // Initialize room with first user
+    roomUsers.set(roomId, new Set([socket.id]));
+    userRoomMap.set(socket.id, roomId);
+    
     socket.join(roomId);
-    roomOccupancy.set(roomId, 1);
     
     // Track analytics
     await trackRoomCreated(roomId, socket.id);
     
-    socket.emit("room-created", roomId); 
-    log(`[Room Created] ID: ${roomId}`);
+    socket.emit("room-created", { roomId, occupancy: 1, capacity: MAX_ROOM_CAPACITY }); 
+    log(`[Room Created] ID: ${roomId} | Creator: ${socket.id}`);
   });
 
   socket.on("join-room", async (roomId) => {
-    const roomSize = roomOccupancy.get(roomId) || 0;
-
-    if (roomSize === 0) {
-      socket.emit("error", "Room ID not found.");
+    // Validate room exists
+    if (!roomExists(roomId)) {
+      socket.emit("error", { 
+        code: 'ROOM_NOT_FOUND', 
+        message: "Room ID not found or has been dismissed." 
+      });
       await logError('room_not_found', 'Room ID not found', { roomId, userId: socket.id });
       return;
     }
-    if (roomSize >= 2) {
-      socket.emit("error", "Room is full.");
-      await logError('room_full', 'Room is full', { roomId, userId: socket.id });
+
+    // Check if room is full
+    const currentOccupancy = getRoomOccupancy(roomId);
+    if (isRoomFull(roomId)) {
+      // Send room-full event to the user trying to join
+      socket.emit("room-full", { 
+        roomId, 
+        occupancy: currentOccupancy, 
+        capacity: MAX_ROOM_CAPACITY,
+        message: `Room is full (${currentOccupancy}/${MAX_ROOM_CAPACITY} users). Cannot join.` 
+      });
+      
+      socket.emit("error", { 
+        code: 'ROOM_FULL', 
+        message: `Room is full (${currentOccupancy}/${MAX_ROOM_CAPACITY} users).` 
+      });
+      await logError('room_full', 'Room is full', { roomId, userId: socket.id, occupancy: currentOccupancy });
+      log(`[Join Rejected] Room: ${roomId} is full | Rejected user: ${socket.id}`);
       return;
     }
 
+    // Add user to room
+    roomUsers.get(roomId).add(socket.id);
+    userRoomMap.set(socket.id, roomId);
     socket.join(roomId);
-    roomOccupancy.set(roomId, roomSize + 1);
+
+    const newOccupancy = getRoomOccupancy(roomId);
 
     // Track analytics
-    await trackRoomJoined(roomId, socket.id, roomSize + 1);
+    await trackRoomJoined(roomId, socket.id, newOccupancy);
 
-    // Notify Initiator that peer has joined (Trigger for Offer)
-    socket.to(roomId).emit("user-joined", socket.id);
+    // Notify other users in room
+    socket.to(roomId).emit("user-joined", { 
+      userId: socket.id,
+      occupancy: newOccupancy,
+      capacity: MAX_ROOM_CAPACITY,
+      isFull: isRoomFull(roomId)
+    });
     
-    // Notify Joiner that success
-    socket.emit("room-joined", roomId);
-    log(`[Room Joined] ID: ${roomId} | User: ${socket.id}`);
+    // Notify joiner of success
+    socket.emit("room-joined", { 
+      roomId, 
+      occupancy: newOccupancy, 
+      capacity: MAX_ROOM_CAPACITY,
+      isFull: isRoomFull(roomId)
+    });
+    
+    log(`[Room Joined] ID: ${roomId} | User: ${socket.id} | Occupancy: ${newOccupancy}/${MAX_ROOM_CAPACITY}`);
+
+    // Notify all users if room is now full
+    if (isRoomFull(roomId)) {
+      io.to(roomId).emit("room-full", { 
+        roomId, 
+        occupancy: newOccupancy, 
+        message: "Room is now full. No more users can join." 
+      });
+      log(`[Room Full] ID: ${roomId}`);
+    }
   });
 
   // --- SIGNALING (Forwarding Logic) ---
+
+  socket.on("leave-room", async () => {
+    const roomId = userRoomMap.get(socket.id);
+    
+    if (roomId && roomUsers.has(roomId)) {
+      const roomUserSet = roomUsers.get(roomId);
+      roomUserSet.delete(socket.id);
+      userRoomMap.delete(socket.id);
+      socket.leave(roomId);
+
+      const remainingOccupancy = roomUserSet.size;
+
+      // Track analytics
+      await trackUserLeft(roomId, socket.id, remainingOccupancy);
+
+      if (remainingOccupancy === 0) {
+        // Room is now empty - dismiss it
+        deleteRoom(roomId);
+      } else {
+        // Notify remaining users
+        socket.to(roomId).emit("user-left", { 
+          userId: socket.id,
+          occupancy: remainingOccupancy,
+          capacity: MAX_ROOM_CAPACITY
+        });
+      }
+
+      socket.emit("room-left", { roomId, message: "Successfully left the room" });
+      log(`[Room Left] Room: ${roomId} | User: ${socket.id} | Remaining: ${remainingOccupancy}/${MAX_ROOM_CAPACITY}`);
+    }
+  });
 
   socket.on("offer", async ({ offer, roomId }) => {
     // Track signaling event
@@ -192,24 +305,44 @@ io.on("connection", (socket) => {
   // --- CLEANUP ---
 
   socket.on("disconnecting", async () => {
-    const rooms = Array.from(socket.rooms);
+    const roomId = userRoomMap.get(socket.id);
     
-    for (const roomId of rooms) {
-      if (roomId !== socket.id && roomOccupancy.has(roomId)) {
-        const newSize = roomOccupancy.get(roomId) - 1;
-        
-        // Track user left
-        await trackUserLeft(roomId, socket.id, newSize);
-        
-        if (newSize <= 0) {
-          roomOccupancy.delete(roomId);
-          log(`[Room Deleted] ID: ${roomId}`);
-        } else {
-          roomOccupancy.set(roomId, newSize);
-          socket.to(roomId).emit("user-left"); 
-        }
+    if (roomId && roomUsers.has(roomId)) {
+      const roomUserSet = roomUsers.get(roomId);
+      roomUserSet.delete(socket.id);
+      userRoomMap.delete(socket.id);
+
+      const remainingOccupancy = roomUserSet.size;
+
+      // Track analytics
+      await trackUserLeft(roomId, socket.id, remainingOccupancy);
+
+      if (remainingOccupancy === 0) {
+        // Room is now empty - dismiss it
+        deleteRoom(roomId);
+      } else {
+        // Notify remaining users
+        socket.to(roomId).emit("user-left", { 
+          userId: socket.id,
+          occupancy: remainingOccupancy,
+          capacity: MAX_ROOM_CAPACITY
+        });
+        log(`[User Left] Room: ${roomId} | User: ${socket.id} | Remaining: ${remainingOccupancy}/${MAX_ROOM_CAPACITY}`);
       }
     }
+  });
+
+  socket.on("disconnect", () => {
+    // Cleanup any remaining references
+    const roomId = userRoomMap.get(socket.id);
+    if (roomId) {
+      userRoomMap.delete(socket.id);
+      const roomUserSet = roomUsers.get(roomId);
+      if (roomUserSet) {
+        roomUserSet.delete(socket.id);
+      }
+    }
+    log(`[Disconnect] Socket ID: ${socket.id}`);
   });
 });
 
@@ -238,9 +371,16 @@ app.get('/api/analytics/summary', async (req, res) => {
 
 // Get current active rooms count
 app.get('/api/analytics/active-rooms', (req, res) => {
+  const activeRooms = Array.from(roomUsers.entries()).map(([roomId, userSet]) => ({ 
+    id: roomId, 
+    userCount: userSet.size,
+    capacity: MAX_ROOM_CAPACITY,
+    isFull: userSet.size >= MAX_ROOM_CAPACITY
+  }));
+  
   res.json({ 
-    activeRooms: roomOccupancy.size,
-    rooms: Array.from(roomOccupancy.entries()).map(([id, count]) => ({ id, userCount: count }))
+    totalActiveRooms: roomUsers.size,
+    rooms: activeRooms
   });
 });
 
