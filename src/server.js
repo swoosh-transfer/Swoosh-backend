@@ -72,6 +72,18 @@ const pingCorsOptions = {
   credentials: false
 };
 
+
+// --- PING ENDPOINT (ALWAYS ALLOW) ---
+// Place this BEFORE the global CORS middleware so it is not affected by strict Origin checks
+app.get('/ping', cors(pingCorsOptions), (req, res) => {
+  res.json({ 
+    status: 'pong', 
+    timestamp: new Date().toISOString(),
+    uptime: process.uptime(),
+    mongodb: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected'
+  });
+});
+
 // Standard CORS configuration for main app
 app.use(cors({
   origin: function (origin, callback) {
