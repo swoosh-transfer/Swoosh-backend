@@ -87,8 +87,8 @@ app.get('/ping', cors(pingCorsOptions), (req, res) => {
 // Standard CORS configuration for main app
 app.use(cors({
   origin: function (origin, callback) {
-    // Block requests with no Origin header to avoid unauthenticated sources (curl, scripts)
-    if (!origin) return callback(new Error('Origin header required'));
+    // Allow requests without Origin header (Render health checks, curl, server-to-server requests)
+    if (!origin) return callback(null, true);
 
     const normalizedOrigin = origin.replace(/\/$/, '');
     if (allowedOrigins.includes(normalizedOrigin)) {
@@ -101,6 +101,15 @@ app.use(cors({
 }));
 
 app.use(express.json());
+
+// Default root route for platform health checks (Render and similar)
+app.get('/', (req, res) => {
+  res.status(200).json({
+    status: 'ok',
+    service: 'swoosh-signaling-server',
+    timestamp: new Date().toISOString()
+  });
+});
 
 const server = http.createServer(app);
 const io = new Server(server, {
@@ -383,14 +392,7 @@ io.on("connection", (socket) => {
 
 // Ping endpoint for keeping app alive (Render free plan, cron jobs, etc.)
 // Allows requests from any origin
-app.get('/ping', cors(pingCorsOptions), (req, res) => {
-  res.json({ 
-    status: 'pong', 
-    timestamp: new Date().toISOString(),
-    uptime: process.uptime(),
-    mongodb: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected'
-  });
-});
+
 
 // Health check endpoint
 app.get('/health', (req, res) => {
@@ -432,4 +434,13 @@ const PORT = process.env.PORT || 5000;
 server.listen(PORT, () => {
   log(`Signaling Server running on port ${PORT}`);
   log(`Analytics API available at http://localhost:${PORT}/api/analytics`);
+});
+
+// Keep process-level failures visible in Render logs.
+process.on('unhandledRejection', (reason) => {
+  console.error('[Unhandled Rejection]:', reason);
+});
+
+process.on('uncaughtException', (error) => {
+  console.error('[Uncaught Exception]:', error);
 });
